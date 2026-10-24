@@ -8,13 +8,20 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type Proxy struct {
 	localAddr   string
 	remoteAddr  string
+	dumpDir     string
+	onCommit    string
+	onCommitDir string
 	listener    net.Listener
 	connections sync.Map
 	connID      int64
@@ -26,14 +33,19 @@ const (
 )
 
 var (
-	end = []byte{0x66, 0x53, 0xb2, 0xa6}
+	end         = []byte{0x66, 0x53, 0xb2, 0xa6}
+	commitCalls = map[string]struct{}{
+		"DevDepot_commitObjects": {},
+		"DevDepot_changeVersion": {},
+	}
 )
 
-func NewProxy(localAddr, remoteAddr string, visitor func(message string) error) *Proxy {
+func NewProxy(localAddr, remoteAddr, dumpDir string, visitor func(message string) error) *Proxy {
 
 	return &Proxy{
 		localAddr:  localAddr,
 		remoteAddr: remoteAddr,
+		dumpDir:    dumpDir,
 		visitor:    visitor,
 	}
 }
@@ -68,11 +80,14 @@ func (p *Proxy) serverConnect(clientConn net.Conn) {
 	defer serverConn.Close()
 	defer clientConn.Close()
 
+	connID := atomic.AddInt64(&p.connID, 1)
+	log.Printf("conn=%d new connection %s -> %s", connID, clientConn.RemoteAddr(), p.remoteAddr)
+
 	// Запускаем двунаправленное копирование данных с логированием
-	p.copy(clientConn, serverConn)
+	p.copy(connID, clientConn, serverConn)
 }
 
-func (p *Proxy) copy(client, server net.Conn) {
+func (p *Proxy) copy(connID int64, client, server net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -84,11 +99,23 @@ func (p *Proxy) copy(client, server net.Conn) {
 		defer wg.Done()
 		defer w.Close()
 
+		seq := 0
+		reader := &delimReader{conn: client, delim: end}
 		for {
-			msg, _ := readUntil(client, end)
+			msg, complete := reader.next()
+			if len(msg) > 0 {
+				p.dumpPacket(connID, seq, msg)
+				seq++
+			}
+			if !complete {
+				break
+			}
 			if err := p.check(msg); err == nil {
 				_, _ = server.Write(msg)
 				_, _ = server.Write(end)
+				if _, ok := commitCalls[callName(msg)]; ok {
+					go p.runCommitHook(msg)
+				}
 			} else {
 				exp := createCrServerExceptionXml("Коммит не соответствует правилам проверки")
 				_, err = w.Write(exp)
@@ -96,7 +123,6 @@ func (p *Proxy) copy(client, server net.Conn) {
 			}
 		}
 	}()
-
 	// Копируем данные от сервера к клиенту (downstream)
 	go func() {
 		defer wg.Done()
@@ -143,21 +169,63 @@ func (p *Proxy) check(line []byte) error {
 	return p.visitor(Opt(node).Data)
 }
 
-func readUntil(r io.Reader, delim []byte) ([]byte, error) {
-	buf := make([]byte, 0, 4096)
-	chunk := make([]byte, 1024)
+func callName(msg []byte) string {
+	if m := callNameRe.FindSubmatch(msg); m != nil {
+		return string(m[1])
+	}
+	return "unknown"
+}
 
+func (p *Proxy) dumpPacket(connID int64, seq int, msg []byte) {
+	if p.dumpDir == "" {
+		return
+	}
+
+	call := callName(msg)
+
+	fn := filepath.Join(p.dumpDir, fmt.Sprintf("conn%d-%03d-%s.xml", connID, seq, call))
+	if err := os.WriteFile(fn, msg, 0644); err != nil {
+		log.Printf("conn=%d seq=%d dump failed: %v", connID, seq, err)
+		return
+	}
+	log.Printf("conn=%d seq=%d call=%s size=%d dumped to %s", connID, seq, call, len(msg), fn)
+
+	if _, ok := commitCalls[call]; ok {
+		p.dumpSources(connID, seq, call, msg)
+	}
+}
+
+var callNameRe = regexp.MustCompile(`<crs:call[^>]*\bname="([^"]+)"`)
+
+// delimReader читает сообщения, разделённые маркером end, сохраняя
+// остаток буфера между чтениями (сообщения могут слипаться в одном TCP-чанке).
+type delimReader struct {
+	conn  io.Reader
+	delim []byte
+	buf   []byte
+	chunk [4096]byte
+}
+
+func (d *delimReader) next() (msg []byte, complete bool) {
 	for {
-		n, err := r.Read(chunk)
-		if n > 0 {
-			buf = append(buf, chunk[:n]...)
-			if idx := bytes.Index(buf, delim); idx != -1 {
-				return buf[:idx], nil
-			}
+		if idx := bytes.Index(d.buf, d.delim); idx != -1 {
+			msg = append(msg, d.buf[:idx]...)
+			copy(d.buf, d.buf[idx+len(d.delim):])
+			d.buf = d.buf[:len(d.buf)-idx-len(d.delim)]
+			return msg, true
 		}
 
+		n, err := d.conn.Read(d.chunk[:])
+		if n > 0 {
+			d.buf = append(d.buf, d.chunk[:n]...)
+		}
 		if err != nil {
-			return buf, err
+			// Хвост без разделителя отдаём как есть (незавершённое сообщение)
+			if len(d.buf) > 0 {
+				msg = append(msg, d.buf...)
+				d.buf = d.buf[:0]
+			}
+			return msg, false
 		}
 	}
 }
